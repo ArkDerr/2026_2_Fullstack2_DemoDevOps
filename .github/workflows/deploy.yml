@@ -24,23 +24,23 @@ jobs:
       EC2_USER: ${{ secrets.EC2_USER }}
 
     steps:
-      # El runner descarga el proyecto.
       - name: 1. Descargar codigo
         uses: actions/checkout@v4
 
-      # Docker construye la imagen en el runner, no en EC2.
+      # El runner construye la imagen; EC2 solo la carga y ejecuta.
       - name: 2. Construir imagen Docker Multi-Stage
+        shell: bash
         run: |
+          set -euo pipefail
           docker build --platform linux/amd64 \
             -t "productos-service:${GITHUB_SHA}" .
 
-      # Solo desplegamos cuando hay un push a main.
       - name: 3. Empaquetar imagen Docker
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
         run: |
           set -euo pipefail
-          docker save "productos-service:${GITHUB_SHA}" \
-            | gzip > productos-image.tar.gz
+          docker save "productos-service:${GITHUB_SHA}" | gzip > productos-image.tar.gz
 
       - name: 4. Preparar conexion SSH
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -54,44 +54,65 @@ jobs:
           printf '%s\n' "$EC2_SSH_KEY" | tr -d '\r' > ~/.ssh/ec2.pem
           chmod 600 ~/.ssh/ec2.pem
 
-          # Para este laboratorio, obtenemos la clave publica del servidor.
+          # Uso academico: lo ideal es verificar la huella SSH previamente.
           for intento in {1..12}; do
-            if ssh-keyscan -T 5 -H "$EC2_HOST" \
-              >> ~/.ssh/known_hosts 2>/dev/null; then
+            if ssh-keyscan -T 5 -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null; then
               break
             fi
             sleep 5
           done
           test -s ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
 
-      # SCP copia la imagen del runner a la instancia.
       - name: 5. Copiar imagen Docker a EC2
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
         run: |
+          set -euo pipefail
           scp -i ~/.ssh/ec2.pem \
             -o BatchMode=yes -o StrictHostKeyChecking=yes \
             productos-image.tar.gz \
             "${EC2_USER}@${EC2_HOST}:productos-image.tar.gz"
 
-      # SSH ejecuta Docker dentro de EC2; no se instala GitHub Runner alli.
       - name: 6. Actualizar contenedor en EC2
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
         run: |
+          set -euo pipefail
           ssh -i ~/.ssh/ec2.pem \
             -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            "${EC2_USER}@${EC2_HOST}" "
-              set -euo pipefail
-              gzip -dc productos-image.tar.gz | docker load
-              docker rm -f productos-container 2>/dev/null || true
-              docker run -d \
-                --name productos-container \
-                --restart unless-stopped \
-                -p 8081:8081 \
-                productos-service:${GITHUB_SHA}
-              rm -f productos-image.tar.gz
-            "
+            "${EC2_USER}@${EC2_HOST}" \
+            "bash -se -- '${GITHUB_SHA}'" <<'REMOTE'
+          set -euo pipefail
+          IMAGE="productos-service:$1"
+          ARCHIVE="productos-image.tar.gz"
 
-      # Validamos la API desde la propia EC2.
+          # Importar imagen construida por GitHub Actions.
+          gzip -dc "$ARCHIVE" | docker load
+
+          # Conservar la BD H2 aunque se elimine el contenedor.
+          docker volume create productos-h2 >/dev/null
+
+          # Garantizar permisos del usuario no root sobre el volumen.
+          docker run --rm \
+            --user 0 \
+            --entrypoint sh \
+            -v productos-h2:/app/data \
+            "$IMAGE" -c 'chown -R 10001:10001 /app/data'
+
+          # Reemplazar solo el contenedor, nunca el volumen.
+          docker rm -f productos-container >/dev/null 2>&1 || true
+          docker run -d \
+            --name productos-container \
+            --restart unless-stopped \
+            -p 8081:8081 \
+            -e DB_DIR=/app/data \
+            -v productos-h2:/app/data \
+            "$IMAGE"
+
+          rm -f "$ARCHIVE"
+          REMOTE
+
       - name: 7. Verificar despliegue en EC2
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
@@ -99,14 +120,17 @@ jobs:
           set -euo pipefail
           for intento in {1..30}; do
             if ssh -i ~/.ssh/ec2.pem \
+              -o BatchMode=yes -o StrictHostKeyChecking=yes \
               "${EC2_USER}@${EC2_HOST}" \
-              "curl -fsS http://127.0.0.1:8081/productos >/dev/null"; then
+              "curl -fsS http://127.0.0.1:8081/api/productos >/dev/null"; then
               echo "La API de Productos responde correctamente."
               exit 0
             fi
             sleep 3
           done
 
-          ssh -i ~/.ssh/ec2.pem "${EC2_USER}@${EC2_HOST}" \
+          ssh -i ~/.ssh/ec2.pem \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "${EC2_USER}@${EC2_HOST}" \
             "docker logs --tail 100 productos-container" || true
           exit 1
